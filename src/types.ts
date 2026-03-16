@@ -6,7 +6,9 @@ export interface Story {
   narrative: string;
   imageUrl: string;
   audioUrl?: string;
+  musicUrl?: string;
   isFavorite?: boolean;
+  mood?: string;
 }
 
 export interface Memory {

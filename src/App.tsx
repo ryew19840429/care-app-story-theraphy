@@ -22,7 +22,7 @@ import { motion, AnimatePresence } from 'motion/react';
 import { clsx, type ClassValue } from 'clsx';
 import { twMerge } from 'tailwind-merge';
 import { Story, Memory } from './types';
-import { generateStoryFromImage, generateStoryAudio, generateSamplePhoto } from './services/gemini';
+import { generateStoryFromImage, generateStoryAudio, generateSamplePhoto, generateMusic } from './services/gemini';
 
 function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
@@ -103,8 +103,10 @@ export default function App() {
   const [isPlaying, setIsPlaying] = useState(false);
   const [isMoodPanelOpen, setIsMoodPanelOpen] = useState(false);
   const [audioCache, setAudioCache] = useState<Record<string, string>>({});
+  const [audioError, setAudioError] = useState<string | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
   const sourceNodeRef = useRef<AudioBufferSourceNode | null>(null);
+  const musicSourceNodeRef = useRef<AudioBufferSourceNode | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const handleAddMemory = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -141,10 +143,18 @@ export default function App() {
       }
       sourceNodeRef.current = null;
     }
+    if (musicSourceNodeRef.current) {
+      try {
+        musicSourceNodeRef.current.stop();
+      } catch (e) {
+        // Ignore if already stopped
+      }
+      musicSourceNodeRef.current = null;
+    }
     setIsPlaying(false);
   };
 
-  const playPCM = async (base64: string) => {
+  const playPCM = async (speechBase64?: string, musicBase64?: string) => {
     stopAudio();
 
     if (!audioContextRef.current) {
@@ -156,31 +166,62 @@ export default function App() {
       await context.resume();
     }
 
-    // Decode base64 to ArrayBuffer
-    const binaryString = atob(base64);
-    const bytes = new Uint8Array(binaryString.length);
-    for (let i = 0; i < binaryString.length; i++) {
-      bytes[i] = binaryString.charCodeAt(i);
+    const createSourceFromPCM = (base64: string, isMusic: boolean) => {
+      const binaryString = atob(base64);
+      const bytes = new Uint8Array(binaryString.length);
+      for (let i = 0; i < binaryString.length; i++) {
+        bytes[i] = binaryString.charCodeAt(i);
+      }
+
+      const int16Array = new Int16Array(bytes.buffer);
+      const float32Array = new Float32Array(int16Array.length);
+      for (let i = 0; i < int16Array.length; i++) {
+        float32Array[i] = int16Array[i] / 32768.0;
+      }
+
+      const audioBuffer = context.createBuffer(1, float32Array.length, 24000);
+      audioBuffer.getChannelData(0).set(float32Array);
+
+      const source = context.createBufferSource();
+      source.buffer = audioBuffer;
+
+      const gainNode = context.createGain();
+      gainNode.gain.value = isMusic ? 0.4 : 1.0; // Music slightly louder since no speech
+
+      source.connect(gainNode);
+      gainNode.connect(context.destination);
+
+      if (isMusic) {
+        source.loop = true;
+        musicSourceNodeRef.current = source;
+      } else {
+        sourceNodeRef.current = source;
+        source.onended = () => {
+          if (!musicSourceNodeRef.current) {
+            setIsPlaying(false);
+          }
+        };
+      }
+
+      return source;
+    };
+
+    try {
+      if (musicBase64) {
+        const musicSource = createSourceFromPCM(musicBase64, true);
+        musicSource.start();
+      }
+      
+      if (speechBase64) {
+        const speechSource = createSourceFromPCM(speechBase64, false);
+        speechSource.start();
+      }
+      
+      setIsPlaying(true);
+    } catch (error) {
+      console.error("Error playing audio:", error);
+      setIsPlaying(false);
     }
-
-    // Gemini returns 16-bit linear PCM
-    const int16Array = new Int16Array(bytes.buffer);
-    const float32Array = new Float32Array(int16Array.length);
-    for (let i = 0; i < int16Array.length; i++) {
-      float32Array[i] = int16Array[i] / 32768.0;
-    }
-
-    const audioBuffer = context.createBuffer(1, float32Array.length, 24000);
-    audioBuffer.getChannelData(0).set(float32Array);
-
-    const source = context.createBufferSource();
-    source.buffer = audioBuffer;
-    source.connect(context.destination);
-    source.onended = () => setIsPlaying(false);
-    
-    sourceNodeRef.current = source;
-    source.start();
-    setIsPlaying(true);
   };
 
   const handleListen = async (story: Story) => {
@@ -189,23 +230,40 @@ export default function App() {
       return;
     }
 
-    if (audioCache[story.id]) {
-      playPCM(audioCache[story.id]);
-      return;
-    }
-
+    setIsAudioLoading(true);
+    setAudioError(null);
     try {
-      setIsAudioLoading(true);
-      const base64 = await generateStoryAudio(story.narrative);
-      setAudioCache(prev => ({ ...prev, [story.id]: base64 }));
-      playPCM(base64);
+      // TTS (Reading) is temporarily disabled due to quota limits
+      /*
+      let speechBase64 = audioCache[story.id];
+      if (!speechBase64) {
+        speechBase64 = await generateStoryAudio(story.narrative);
+        setAudioCache(prev => ({ ...prev, [story.id]: speechBase64 }));
+      }
+      */
+
+      let musicBase64 = story.musicUrl;
+      if (!musicBase64) {
+        // Generate music on the fly if not already in story
+        musicBase64 = await generateMusic(story.mood || "peaceful and nostalgic");
+        // Update story with music for future use
+        setStories(prev => prev.map(s => s.id === story.id ? { ...s, musicUrl: musicBase64 } : s));
+        if (activeStory.id === story.id) {
+          setActiveStory(prev => ({ ...prev, musicUrl: musicBase64 }));
+        }
+      }
+
+      await playPCM(undefined, musicBase64);
     } catch (error: any) {
       console.error("Failed to generate audio:", error);
       if (error?.message?.includes('429') || error?.message?.includes('quota')) {
-        alert("The AI narrator is currently resting (quota reached). Please try again in a few minutes!");
+        setAudioError("The AI is currently resting (quota reached). Please try again in a few minutes.");
       } else {
-        alert("Sorry, I couldn't start the narration right now.");
+        setAudioError("Sorry, I couldn't start the music right now.");
       }
+      
+      // Clear error after 5 seconds
+      setTimeout(() => setAudioError(null), 5000);
     } finally {
       setIsAudioLoading(false);
     }
@@ -219,7 +277,30 @@ export default function App() {
     };
   }, []);
 
+  const urlToBase64 = async (url: string): Promise<string> => {
+    if (url.startsWith('data:')) return url;
+    try {
+      const response = await fetch(url);
+      const blob = await response.blob();
+      return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onloadend = () => resolve(reader.result as string);
+        reader.onerror = reject;
+        reader.readAsDataURL(blob);
+      });
+    } catch (error) {
+      console.error("Failed to convert URL to base64:", error);
+      return url; // Fallback to original URL (which might fail later but we tried)
+    }
+  };
+
   const handleGenerateSample = async (mood?: string) => {
+    if (memories.length === 0) {
+      setIsMoodPanelOpen(false);
+      alert("Please add some real photos in settings first to create memories.");
+      return;
+    }
+
     setIsMoodPanelOpen(false);
     setIsStoryGenerating(true);
     stopAudio();
@@ -229,25 +310,18 @@ export default function App() {
       let suggestedDate = '';
       let suggestedLocation = '';
 
-      if (memories.length > 0) {
-        // Pick a random memory from settings
-        const randomMemory = memories[Math.floor(Math.random() * memories.length)];
-        imageUrl = randomMemory.imageUrl;
-        contextText = randomMemory.description;
-        suggestedDate = randomMemory.date || '';
-        suggestedLocation = randomMemory.location || '';
-      } else {
-        // Fallback to sample photo generation if no memories exist
-        const prompts = [
-          "A family picnic in a sunny park with a red checkered blanket",
-          "A young couple dancing in a vintage living room",
-          "A child riding a bicycle on a suburban street"
-        ];
-        const randomPrompt = prompts[Math.floor(Math.random() * prompts.length)];
-        imageUrl = await generateSamplePhoto(randomPrompt);
-      }
+      // Pick a random memory from settings
+      const randomMemory = memories[Math.floor(Math.random() * memories.length)];
+      imageUrl = randomMemory.imageUrl;
+      contextText = randomMemory.description;
+      suggestedDate = randomMemory.date || '';
+      suggestedLocation = randomMemory.location || '';
       
-      const storyData = await generateStoryFromImage(imageUrl, mood, contextText);
+      // Ensure we have base64 for the API
+      const imageBase64 = await urlToBase64(imageUrl);
+      
+      // Generate story from image (Music generation moved to play button for speed)
+      const storyData = await generateStoryFromImage(imageBase64, mood, contextText);
       
       const newStory: Story = {
         id: Date.now().toString(),
@@ -256,7 +330,9 @@ export default function App() {
         date: storyData.date || suggestedDate || "Unknown Date",
         narrative: storyData.narrative || "A beautiful new memory to cherish.",
         imageUrl: imageUrl,
-        isFavorite: false
+        musicUrl: '', // Will be generated on-demand
+        isFavorite: false,
+        mood: mood
       };
       
       setStories(prev => [newStory, ...prev]);
@@ -302,14 +378,14 @@ export default function App() {
               transition={{ type: "spring", damping: 25, stiffness: 200 }}
               className="bg-white rounded-3xl shadow-xl shadow-slate-200/50 overflow-hidden border border-slate-100"
             >
-              <div className="relative aspect-[4/3]">
-                <img 
-                  src={activeStory.imageUrl} 
-                  alt={activeStory.title}
-                  className="w-full h-full object-cover"
-                  referrerPolicy="no-referrer"
-                />
-                <div className="absolute inset-0 bg-gradient-to-t from-black/70 via-black/20 to-transparent" />
+                <div className="relative aspect-[4/3]">
+                  <img 
+                    src={activeStory.imageUrl} 
+                    alt={activeStory.title}
+                    className="w-full h-full object-cover"
+                    referrerPolicy="no-referrer"
+                  />
+                  <div className="absolute inset-0 bg-gradient-to-t from-black/70 via-black/20 to-transparent" />
                 <div className="absolute bottom-6 left-6 text-white space-y-1 pr-24">
                   <h3 className="text-2xl font-bold">{activeStory.title}</h3>
                   <div className="flex items-center gap-1 text-white/80 text-sm">
@@ -318,7 +394,16 @@ export default function App() {
                   </div>
                 </div>
 
-                <div className="absolute top-4 right-4 flex flex-col gap-3">
+                <div className="absolute top-4 right-4 flex flex-col gap-3 items-end">
+                  {audioError && (
+                    <motion.div 
+                      initial={{ opacity: 0, x: 20 }}
+                      animate={{ opacity: 1, x: 0 }}
+                      className="bg-red-500 text-white text-[10px] px-3 py-2 rounded-xl shadow-lg max-w-[180px] text-right leading-tight"
+                    >
+                      {audioError}
+                    </motion.div>
+                  )}
                   <button 
                     onClick={() => handleListen(activeStory)}
                     disabled={isAudioLoading || isStoryGenerating}
