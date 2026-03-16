@@ -1,0 +1,7 @@
+{
+  "name": "Memoria",
+  "description": "AI-powered reminiscence therapy for Alzheimer's patients, generating warm life stories from memories.",
+  "requestFramePermissions": [
+    "microphone"
+  ]
+}
